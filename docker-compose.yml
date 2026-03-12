@@ -1,36 +1,48 @@
+version: '3.8'
+
 services:
   db:
     image: postgres:16
-    container_name: clothing-store-db
+    container_name: clothing_store_db
+    restart: unless-stopped
     environment:
       POSTGRES_DB: clothing_store
-      POSTGRES_USER: clothing_user
-      POSTGRES_PASSWORD: clothing_pass
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
     ports:
       - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./db/migrate-schema.sql:/docker-entrypoint-initdb.d/01-migrate-schema.sql
-      - ./db/sample-data.sql:/docker-entrypoint-initdb.d/02-sample-data.sql
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql
 
-  fastapi-app:
-    build:
-      context: .
-    container_name: clothing-store-api
+  api:
+    build: .
+    container_name: clothing_store_api
+    restart: unless-stopped
     depends_on:
       - db
-    environment:
-      PYTHONUNBUFFERED: "1"
-      MODE: ${MODE:-development}
-      DATABASE_URL: ${DATABASE_URL}
-      SECRET_KEY: ${SECRET_KEY}
-      ACCESS_TOKEN_EXPIRE_MINUTES: ${ACCESS_TOKEN_EXPIRE_MINUTES:-30}
-    volumes:
-      - ./app:/code/app
-      - ./db:/code/db
-      - ./db_migration.py:/code/db_migration.py
+    env_file:
+      - .env
     ports:
-      - "8080:8080"
+      - "8080:8000"
+
+  dbgate:
+    image: dbgate/dbgate:latest
+    container_name: clothing_store_dbgate
+    restart: unless-stopped
+    depends_on:
+      - db
+    ports:
+      - "3000:3000"
+    environment:
+      CONNECTIONS: con1
+      LABEL_con1: Clothing Store DB
+      SERVER_con1: db
+      USER_con1: postgres
+      PASSWORD_con1: postgres
+      PORT_con1: 5432
+      ENGINE_con1: postgres
+      DATABASE_con1: clothing_store
 
 volumes:
   postgres_data:
