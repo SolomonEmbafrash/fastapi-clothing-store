@@ -1,42 +1,22 @@
-import os, psycopg
+from pathlib import Path
+import os
+
+import psycopg
 from dotenv import load_dotenv
 
 load_dotenv()
-
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-def get_conn():
-    return psycopg.connect(DATABASE_URL, autocommit=True)
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set")
 
-# Migration: create / update database schema
-def migrate_schema():
-    print("INFO: Migrating schema...")
-    try:
-        with open("./db/migrate-schema.sql") as f:
-            schema_sql = f.read()
-        with get_conn() as conn, conn.cursor() as cur:
-            cur.execute(schema_sql)
-            print("INFO: DB Schema migrated.")
-    except Exception as e:
-        print(f"ERROR: Failed to migrate schema: {e}")
+root = Path(__file__).resolve().parent
+schema_path = root / "db" / "migrate-schema.sql"
+sample_path = root / "db" / "sample-data.sql"
 
-def seed_sample_data():
-    print("INFO: Checking sample data...")
-    try:
-        with get_conn() as conn, conn.cursor() as cur:
-            # Check if categories table is empty
-            cur.execute("SELECT 1 FROM categories LIMIT 1")
-            if cur.fetchone():
-                print("INFO: Tables not empty, skip data seed.")
-            else:
-                print("INFO: Seeding sample data...")
-                with open("./db/sample-data.sql") as f:
-                    data_sql = f.read()
-                    cur.execute(data_sql)
-                    print("INFO: Sample data inserted.")
-    except Exception as e:
-        print(f"ERROR: Failed to seed data: {e}")
+with psycopg.connect(DATABASE_URL, autocommit=True) as conn:
+    with conn.cursor() as cur:
+        cur.execute(schema_path.read_text(encoding="utf-8"))
+        cur.execute(sample_path.read_text(encoding="utf-8"))
 
-if __name__ == "__main__":
-    migrate_schema()
-    seed_sample_data()
+print("Database migration and sample data completed successfully.")

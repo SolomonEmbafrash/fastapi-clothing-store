@@ -1,265 +1,569 @@
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import OAuth2PasswordBearer
+from __future__ import annotations
+
+import base64
+import hashlib
+import hmac
+import os
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from typing import Generator
+
+import jwt
+import psycopg
 from dotenv import load_dotenv
-import os, psycopg, jwt
+from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from psycopg.rows import dict_row
-from passlib.context import CryptContext
-from datetime import datetime, timedelta
+from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
 load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
-SECRET_KEY = os.getenv("SECRET_KEY", "supersecret")
-ALGO = "HS256"
+SECRET_KEY = os.getenv("SECRET_KEY", "change-me-in-production")
+ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+ALGORITHM = "HS256"
 
-pwd_cxt = CryptContext(schemes=["bcrypt"], deprecated="auto")
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="users/login")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is not set. Add it to your .env file or environment.")
 
-app = FastAPI()
+app = FastAPI(title="FastAPI Clothing Store", version="1.0.0")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/users/login")
 
-def get_conn():
-    return psycopg.connect(DATABASE_URL, autocommit=True, row_factory=psycopg.rows.dict_row)
 
-def hash_pwd(pwd): return pwd_cxt.hash(pwd)
-def verify_pwd(plain, hashed): return pwd_cxt.verify(plain, hashed)
-def create_token(data):
-    return jwt.encode({**data, "exp": datetime.utcnow() + timedelta(minutes=30)}, SECRET_KEY, algorithm=ALGO)
-
-def get_current_user(token: str = Depends(oauth2_scheme)):
+# ---------- Database ----------
+def get_conn() -> Generator[psycopg.Connection, None, None]:
+    conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     try:
-        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGO])
-        return int(payload.get("sub"))
-    except: raise HTTPException(401, "Invalid token")
+        yield conn
+    finally:
+        conn.close()
 
-def get_current_admin(user_id: int = Depends(get_current_user)):
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT role FROM customers WHERE customer_id = %s", (user_id,))
-        if not (user := cur.fetchone()) or user["role"] != "admin":
-            raise HTTPException(403, "Admin privileges required")
-    return user_id
 
-@app.get("/")
+# ---------- Password hashing ----------
+def hash_password(password: str, iterations: int = 100_000) -> str:
+    salt = os.urandom(16)
+    derived_key = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+    return (
+        f"pbkdf2_sha256${iterations}$"
+        f"{base64.urlsafe_b64encode(salt).decode()}$"
+        f"{base64.urlsafe_b64encode(derived_key).decode()}"
+    )
+
+
+def verify_password(password: str, stored_hash: str) -> bool:
+    try:
+        algorithm, iterations_str, salt_b64, hash_b64 = stored_hash.split("$")
+        if algorithm != "pbkdf2_sha256":
+            return False
+        iterations = int(iterations_str)
+        salt = base64.urlsafe_b64decode(salt_b64.encode())
+        expected_hash = base64.urlsafe_b64decode(hash_b64.encode())
+        actual_hash = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, iterations)
+        return hmac.compare_digest(actual_hash, expected_hash)
+    except Exception:
+        return False
+
+
+# ---------- Auth helpers ----------
+def create_access_token(user_id: int, role: str) -> str:
+    expires_at = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": str(user_id), "role": role, "exp": expires_at}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = int(payload.get("sub"))
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token")
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT customer_id, first_name, last_name, email, role
+            FROM customers
+            WHERE customer_id = %s
+            """,
+            (user_id,),
+        )
+        user = cur.fetchone()
+
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    return user
+
+
+def get_current_admin(current_user: dict = Depends(get_current_user)) -> dict:
+    if current_user["role"] != "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin privileges required")
+    return current_user
+
+
+# ---------- Pydantic models ----------
+class MessageResponse(BaseModel):
+    message: str
+
+
+class UserCreate(BaseModel):
+    first_name: str = Field(min_length=1, max_length=100)
+    last_name: str = Field(min_length=1, max_length=100)
+    email: EmailStr
+    password: str = Field(min_length=6, max_length=128)
+
+
+class UserOut(BaseModel):
+    customer_id: int
+    first_name: str
+    last_name: str
+    email: EmailStr
+    role: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class CategoryCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+
+
+class CategoryOut(BaseModel):
+    category_id: int
+    name: str
+
+
+class ProductCreate(BaseModel):
+    category_id: int
+    name: str = Field(min_length=1, max_length=150)
+    price: Decimal = Field(gt=0)
+    stock: int = Field(ge=0, default=0)
+
+
+class ProductUpdate(BaseModel):
+    category_id: int | None = None
+    name: str | None = Field(default=None, min_length=1, max_length=150)
+    price: Decimal | None = Field(default=None, gt=0)
+    stock: int | None = Field(default=None, ge=0)
+
+
+class ProductOut(BaseModel):
+    product_id: int
+    category_id: int
+    category_name: str
+    name: str
+    price: Decimal
+    stock: int
+
+
+class OrderCreate(BaseModel):
+    product_id: int
+    quantity: int = Field(ge=1, default=1)
+
+
+class OrderCreated(BaseModel):
+    order_id: int
+    status: str
+    product_name: str
+    price_per_unit: Decimal
+    quantity: int
+    total_price: Decimal
+
+
+class OrderSummary(BaseModel):
+    order_id: int
+    order_date: datetime
+    total_amount: Decimal
+
+
+class UserStats(BaseModel):
+    customer_id: int
+    email: EmailStr
+    total_orders: int
+    total_spent: Decimal
+
+
+class ProductStats(BaseModel):
+    product_id: int
+    name: str
+    times_ordered: int
+    total_units_sold: int
+    total_revenue: Decimal
+
+
+# ---------- Routes ----------
+@app.get("/", response_model=dict)
 def get_root():
-    return { "msg": "Clothing Store v0.1" }
+    return {"message": "Clothing Store API is running"}
 
-# POST /users (Register)
-@app.post("/users", status_code=201)
-def register(data: dict):
-    first, last, email, pwd = data.get("first_name"), data.get("last_name"), data.get("email"), data.get("password")
-    if not all([first, last, email, pwd]): raise HTTPException(400, "Missing fields")
-    
-    with get_conn() as conn, conn.cursor() as cur:
-        try:
-            cur.execute(
-                "INSERT INTO customers (first_name, last_name, email, password_hash) VALUES (%s, %s, %s, %s) RETURNING customer_id",
-                (first, last, email, hash_pwd(pwd))
-            )
-            return {"customer_id": cur.fetchone()["customer_id"], "msg": "Registered"}
-        except psycopg.errors.UniqueViolation: raise HTTPException(400, "Email exists")
 
-# POST /users/login
-@app.post("/users/login")
-def login(data: dict):
-    email, pwd = data.get("email"), data.get("password")
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT customer_id, password_hash FROM customers WHERE email = %s", (email,))
-        if not (user := cur.fetchone()) or not verify_pwd(pwd, user["password_hash"]):
-            raise HTTPException(401, "Invalid credentials")
-        return {"access_token": create_token({"sub": str(user["customer_id"])}), "token_type": "bearer"}
+@app.get("/health", response_model=dict)
+def health_check(conn: psycopg.Connection = Depends(get_conn)):
+    with conn.cursor() as cur:
+        cur.execute("SELECT 1 AS ok")
+        result = cur.fetchone()
+    return {"status": "ok", "database": result["ok"] == 1}
 
-# DELETE /users/{id} (Admin only)
-@app.delete("/users/{user_id}", status_code=200)
-def delete_user(user_id: int, admin_id: int = Depends(get_current_admin)):
-    with get_conn() as conn, conn.cursor() as cur:
-        try:
-            cur.execute("DELETE FROM customers WHERE customer_id = %s RETURNING customer_id", (user_id,))
-            if not cur.fetchone(): raise HTTPException(404, "User not found")
-            return {"msg": "User deleted"}
-        except psycopg.errors.ForeignKeyViolation:
-            raise HTTPException(400, "Cannot delete user with existing orders")
 
-# GET /categories 
-@app.get("/categories")
-def get_categories():
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT category_id, name FROM categories ORDER BY category_id;")
+@app.post("/users", response_model=UserOut, status_code=status.HTTP_201_CREATED)
+def register_user(payload: UserCreate, conn: psycopg.Connection = Depends(get_conn)):
+    with conn.cursor() as cur:
+        cur.execute("SELECT customer_id FROM customers WHERE email = %s", (payload.email,))
+        if cur.fetchone():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Email already exists")
+
+        cur.execute(
+            """
+            INSERT INTO customers (first_name, last_name, email, password_hash, role)
+            VALUES (%s, %s, %s, %s, 'customer')
+            RETURNING customer_id, first_name, last_name, email, role
+            """,
+            (
+                payload.first_name,
+                payload.last_name,
+                payload.email,
+                hash_password(payload.password),
+            ),
+        )
+        user = cur.fetchone()
+        conn.commit()
+        return user
+
+
+@app.post("/users/login", response_model=TokenResponse)
+def login_user(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT customer_id, email, password_hash, role
+            FROM customers
+            WHERE email = %s
+            """,
+            (form_data.username,),
+        )
+        user = cur.fetchone()
+
+    if not user or not verify_password(form_data.password, user["password_hash"]):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid email or password")
+
+    token = create_access_token(user["customer_id"], user["role"])
+    return TokenResponse(access_token=token)
+
+
+@app.get("/users/me", response_model=UserOut)
+def get_me(current_user: dict = Depends(get_current_user)):
+    return current_user
+
+
+@app.delete("/users/{user_id}", response_model=MessageResponse)
+def delete_user(
+    user_id: int,
+    admin_user: dict = Depends(get_current_admin),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    if user_id == admin_user["customer_id"]:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Admin cannot delete themself")
+
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM customers WHERE customer_id = %s RETURNING customer_id", (user_id,))
+        deleted = cur.fetchone()
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+        conn.commit()
+    return MessageResponse(message="User deleted")
+
+
+@app.get("/categories", response_model=list[CategoryOut])
+def get_categories(conn: psycopg.Connection = Depends(get_conn)):
+    with conn.cursor() as cur:
+        cur.execute("SELECT category_id, name FROM categories ORDER BY category_id")
         return cur.fetchall()
 
-# GET /categories/{id}
-@app.get("/categories/{category_id}")
-def get_category(category_id: int):
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT category_id, name FROM categories WHERE category_id = %s;", (category_id,))
-        row = cur.fetchone()
-        if not row:
-            raise HTTPException(status_code=404, detail="Category not found")
-        return row
 
-# POST /categories (Admin only)
-@app.post("/categories", status_code=201)
-def create_category(data: dict, admin_id: int = Depends(get_current_admin)):
-    name = data.get("name")
-    if not name:
-        raise HTTPException(status_code=400, detail="Missing 'name'")
-    with get_conn() as conn, conn.cursor() as cur:
-        try:
-            cur.execute("INSERT INTO categories (name) VALUES (%s) RETURNING category_id, name;", (name,))
-            return cur.fetchone()
-        except psycopg.errors.UniqueViolation:
-            raise HTTPException(400, "Category already exists")
+@app.get("/categories/{category_id}", response_model=CategoryOut)
+def get_category(category_id: int, conn: psycopg.Connection = Depends(get_conn)):
+    with conn.cursor() as cur:
+        cur.execute("SELECT category_id, name FROM categories WHERE category_id = %s", (category_id,))
+        category = cur.fetchone()
+    if not category:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
+    return category
 
-# PUT /categories/{id} (Admin only)
-@app.put("/categories/{category_id}")
-def update_category(category_id: int, data: dict, admin_id: int = Depends(get_current_admin)):
-    name = data.get("name")
-    if not name: raise HTTPException(400, "Missing 'name'")
-    with get_conn() as conn, conn.cursor() as cur:
-        try:
-            cur.execute("UPDATE categories SET name = %s WHERE category_id = %s RETURNING category_id, name", (name, category_id))
-            if not (cat := cur.fetchone()): raise HTTPException(404, "Category not found")
-            return cat
-        except psycopg.errors.UniqueViolation:
-            raise HTTPException(400, "Category name already exists")
 
-# DELETE /categories/{id} (Admin only)
-@app.delete("/categories/{category_id}", status_code=200)
-def delete_category(category_id: int, admin_id: int = Depends(get_current_admin)):
-    with get_conn() as conn, conn.cursor() as cur:
-        try:
-            cur.execute("DELETE FROM categories WHERE category_id = %s RETURNING category_id", (category_id,))
-            if not cur.fetchone(): raise HTTPException(404, "Category not found")
-            return {"msg": "Category deleted"}
-        except psycopg.errors.ForeignKeyViolation:
-            raise HTTPException(400, "Cannot delete category containing products")
+@app.post("/categories", response_model=CategoryOut, status_code=status.HTTP_201_CREATED)
+def create_category(
+    payload: CategoryCreate,
+    _: dict = Depends(get_current_admin),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    with conn.cursor() as cur:
+        cur.execute("SELECT category_id FROM categories WHERE LOWER(name) = LOWER(%s)", (payload.name,))
+        if cur.fetchone():
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Category already exists")
 
-# GET /products
-@app.get("/products")
-def get_products():
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT p.product_id, p.name, c.name as category_name, p.price, p.stock 
-            FROM products p 
-            JOIN categories c ON p.category_id = c.category_id
-            ORDER BY p.product_id;
-        """)
+        cur.execute(
+            "INSERT INTO categories (name) VALUES (%s) RETURNING category_id, name",
+            (payload.name,),
+        )
+        category = cur.fetchone()
+        conn.commit()
+        return category
+
+
+@app.put("/categories/{category_id}", response_model=CategoryOut)
+def update_category(
+    category_id: int,
+    payload: CategoryCreate,
+    _: dict = Depends(get_current_admin),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    with conn.cursor() as cur:
+        cur.execute(
+            "UPDATE categories SET name = %s WHERE category_id = %s RETURNING category_id, name",
+            (payload.name, category_id),
+        )
+        category = cur.fetchone()
+        if not category:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
+        conn.commit()
+        return category
+
+
+@app.delete("/categories/{category_id}", response_model=MessageResponse)
+def delete_category(
+    category_id: int,
+    _: dict = Depends(get_current_admin),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM categories WHERE category_id = %s RETURNING category_id", (category_id,))
+        deleted = cur.fetchone()
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
+        conn.commit()
+    return MessageResponse(message="Category deleted")
+
+
+@app.get("/products", response_model=list[ProductOut])
+def get_products(conn: psycopg.Connection = Depends(get_conn)):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT p.product_id, p.category_id, c.name AS category_name, p.name, p.price, p.stock
+            FROM products p
+            JOIN categories c ON c.category_id = p.category_id
+            ORDER BY p.product_id
+            """
+        )
         return cur.fetchall()
 
-# POST /products (Admin only)
-@app.post("/products", status_code=201)
-def create_product(data: dict, admin_id: int = Depends(get_current_admin)):
-    cat_id, name, price, stock = data.get("category_id"), data.get("name"), data.get("price"), data.get("stock", 0)
-    if not all([cat_id, name, price]): raise HTTPException(400, "Missing fields")
-    with get_conn() as conn, conn.cursor() as cur:
+
+@app.post("/products", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
+def create_product(
+    payload: ProductCreate,
+    _: dict = Depends(get_current_admin),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    with conn.cursor() as cur:
+        cur.execute("SELECT category_id FROM categories WHERE category_id = %s", (payload.category_id,))
+        if not cur.fetchone():
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
+
+        cur.execute(
+            """
+            INSERT INTO products (category_id, name, price, stock)
+            VALUES (%s, %s, %s, %s)
+            RETURNING product_id, category_id, name, price, stock
+            """,
+            (payload.category_id, payload.name, payload.price, payload.stock),
+        )
+        product = cur.fetchone()
+        conn.commit()
+
+        cur.execute("SELECT name FROM categories WHERE category_id = %s", (product["category_id"],))
+        category = cur.fetchone()
+
+    return {**product, "category_name": category["name"]}
+
+
+@app.put("/products/{product_id}", response_model=ProductOut)
+def update_product(
+    product_id: int,
+    payload: ProductUpdate,
+    _: dict = Depends(get_current_admin),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    updates = payload.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No fields provided to update")
+
+    if "category_id" in updates:
+        with conn.cursor() as cur:
+            cur.execute("SELECT category_id FROM categories WHERE category_id = %s", (updates["category_id"],))
+            if not cur.fetchone():
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Category not found")
+
+    columns = []
+    values = []
+    for field_name, value in updates.items():
+        columns.append(f"{field_name} = %s")
+        values.append(value)
+    values.append(product_id)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            UPDATE products
+            SET {', '.join(columns)}
+            WHERE product_id = %s
+            RETURNING product_id, category_id, name, price, stock
+            """,
+            values,
+        )
+        product = cur.fetchone()
+        if not product:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+        conn.commit()
+
+        cur.execute("SELECT name FROM categories WHERE category_id = %s", (product["category_id"],))
+        category = cur.fetchone()
+
+    return {**product, "category_name": category["name"]}
+
+
+@app.delete("/products/{product_id}", response_model=MessageResponse)
+def delete_product(
+    product_id: int,
+    _: dict = Depends(get_current_admin),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM products WHERE product_id = %s RETURNING product_id", (product_id,))
+        deleted = cur.fetchone()
+        if not deleted:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+        conn.commit()
+    return MessageResponse(message="Product deleted")
+
+
+@app.post("/orders", response_model=OrderCreated, status_code=status.HTTP_201_CREATED)
+def create_order(
+    payload: OrderCreate,
+    current_user: dict = Depends(get_current_user),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT product_id, name, price, stock FROM products WHERE product_id = %s",
+            (payload.product_id,),
+        )
+        product = cur.fetchone()
+
+        if not product:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+        if product["stock"] < payload.quantity:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Not enough stock")
+
         try:
             cur.execute(
-                "INSERT INTO products (category_id, name, price, stock) VALUES (%s, %s, %s, %s) RETURNING product_id, name, price, stock",
-                (cat_id, name, price, stock)
+                "INSERT INTO orders (customer_id) VALUES (%s) RETURNING order_id, order_date",
+                (current_user["customer_id"],),
             )
-            return cur.fetchone()
-        except psycopg.errors.UniqueViolation:
-            raise HTTPException(400, "Product already exists")
+            order = cur.fetchone()
+            cur.execute(
+                "INSERT INTO order_items (order_id, product_id, quantity) VALUES (%s, %s, %s)",
+                (order["order_id"], payload.product_id, payload.quantity),
+            )
+            cur.execute(
+                "UPDATE products SET stock = stock - %s WHERE product_id = %s",
+                (payload.quantity, payload.product_id),
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
 
-# PUT /products/{id} (Admin only)
-@app.put("/products/{product_id}")
-def update_product(product_id: int, data: dict, admin_id: int = Depends(get_current_admin)):
-    # Allow partial updates
-    fields = {k: v for k, v in data.items() if k in ["category_id", "name", "price", "stock"]}
-    if not fields: raise HTTPException(400, "No valid fields to update")
-    
-    set_clause = ", ".join([f"{k} = %s" for k in fields.keys()])
-    values = list(fields.values()) + [product_id]
-    
-    with get_conn() as conn, conn.cursor() as cur:
-        try:
-            cur.execute(f"UPDATE products SET {set_clause} WHERE product_id = %s RETURNING product_id, name, price, stock", values)
-            if not (p := cur.fetchone()): raise HTTPException(404, "Product not found")
-            return p
-        except psycopg.errors.UniqueViolation:
-            raise HTTPException(400, "Product name already exists")
+    total_price = product["price"] * payload.quantity
+    return OrderCreated(
+        order_id=order["order_id"],
+        status="created",
+        product_name=product["name"],
+        price_per_unit=product["price"],
+        quantity=payload.quantity,
+        total_price=total_price,
+    )
 
-# DELETE /products/{id} (Admin only)
-@app.delete("/products/{product_id}", status_code=200)
-def delete_product(product_id: int, admin_id: int = Depends(get_current_admin)):
-    with get_conn() as conn, conn.cursor() as cur:
-        try:
-            cur.execute("DELETE FROM products WHERE product_id = %s RETURNING product_id", (product_id,))
-            if not cur.fetchone(): raise HTTPException(404, "Product not found")
-            return {"msg": "Product deleted"}
-        except psycopg.errors.ForeignKeyViolation:
-            raise HTTPException(400, "Cannot delete product associated with orders")
 
-# POST /orders
-@app.post("/orders", status_code=201)
-def create_order(data: dict, user_id: int = Depends(get_current_user)):
-    product_id, quantity = data.get("product_id"), data.get("quantity", 1)
-    if not product_id: raise HTTPException(400, "Missing product_id")
-
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("SELECT name, price, stock FROM products WHERE product_id = %s", (product_id,))
-        if not (p := cur.fetchone()): raise HTTPException(404, "Product not found")
-        if p["stock"] < quantity: raise HTTPException(400, "Not enough stock")
-
-        with conn.transaction():
-            cur.execute("INSERT INTO orders (customer_id) VALUES (%s) RETURNING order_id", (user_id,))
-            order_id = cur.fetchone()["order_id"]
-            cur.execute("INSERT INTO order_items (order_id, product_id, quantity) VALUES (%s, %s, %s)", (order_id, product_id, quantity))
-            cur.execute("UPDATE products SET stock = stock - %s WHERE product_id = %s", (quantity, product_id))
-
-    return {
-        "order_id": order_id, "status": "created", "product_name": p["name"],
-        "price_per_unit": p["price"], "quantity": quantity, "total_price": p["price"] * quantity
-    }
-
-# GET /orders (Protected)
-@app.get("/orders")
-def get_orders(user_id: int = Depends(get_current_user)):
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT o.order_id, o.order_date, SUM(oi.quantity * p.price) as total_amount 
+@app.get("/orders", response_model=list[OrderSummary])
+def get_orders(
+    current_user: dict = Depends(get_current_user),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT o.order_id, o.order_date, SUM(oi.quantity * p.price) AS total_amount
             FROM orders o
-            JOIN order_items oi ON o.order_id = oi.order_id
-            JOIN products p ON oi.product_id = p.product_id
+            JOIN order_items oi ON oi.order_id = o.order_id
+            JOIN products p ON p.product_id = oi.product_id
             WHERE o.customer_id = %s
             GROUP BY o.order_id, o.order_date
-            ORDER BY o.order_date DESC
-        """, (user_id,))
+            ORDER BY o.order_date DESC, o.order_id DESC
+            """,
+            (current_user["customer_id"],),
+        )
         return cur.fetchall()
 
-# GET /statistics/users
-@app.get("/statistics/users")
-def get_user_stats(admin_id: int = Depends(get_current_admin)):
-    # Return: List of {customer_id, email, total_orders, total_spent}
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT 
-                c.customer_id, 
-                c.email, 
-                COUNT(DISTINCT o.order_id) as total_orders, 
-                SUM(oi.quantity * p.price) as total_spent
+
+@app.get("/statistics/users", response_model=list[UserStats])
+def get_user_statistics(
+    _: dict = Depends(get_current_admin),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                c.customer_id,
+                c.email,
+                COUNT(DISTINCT o.order_id) AS total_orders,
+                COALESCE(SUM(oi.quantity * p.price), 0) AS total_spent
             FROM customers c
-            JOIN orders o ON c.customer_id = o.customer_id
-            JOIN order_items oi ON o.order_id = oi.order_id
-            JOIN products p ON oi.product_id = p.product_id
+            LEFT JOIN orders o ON o.customer_id = c.customer_id
+            LEFT JOIN order_items oi ON oi.order_id = o.order_id
+            LEFT JOIN products p ON p.product_id = oi.product_id
             GROUP BY c.customer_id, c.email
-            ORDER BY total_spent DESC;
-        """)
+            ORDER BY total_spent DESC, c.customer_id ASC
+            """
+        )
         return cur.fetchall()
 
-# GET /statistics/products
-@app.get("/statistics/products")
-def get_product_stats(admin_id: int = Depends(get_current_admin)):
-    # Return: List of {product_id, name, total_sold, total_revenue}
-    with get_conn() as conn, conn.cursor() as cur:
-        cur.execute("""
-            SELECT 
-                p.product_id, 
-                p.name, 
-                COUNT(oi.order_item_id) as times_ordered, 
-                SUM(oi.quantity) as total_units_sold, 
-                SUM(oi.quantity * p.price) as total_revenue
+
+@app.get("/statistics/products", response_model=list[ProductStats])
+def get_product_statistics(
+    _: dict = Depends(get_current_admin),
+    conn: psycopg.Connection = Depends(get_conn),
+):
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT
+                p.product_id,
+                p.name,
+                COUNT(oi.order_item_id) AS times_ordered,
+                COALESCE(SUM(oi.quantity), 0) AS total_units_sold,
+                COALESCE(SUM(oi.quantity * p.price), 0) AS total_revenue
             FROM products p
-            JOIN order_items oi ON p.product_id = oi.product_id
+            LEFT JOIN order_items oi ON oi.product_id = p.product_id
             GROUP BY p.product_id, p.name
-            ORDER BY total_revenue DESC;
-        """)
+            ORDER BY total_revenue DESC, p.product_id ASC
+            """
+        )
         return cur.fetchall()

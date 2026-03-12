@@ -1,18 +1,13 @@
-@baseUrl = {{$dotenv API_URL}}
+### Health check
+GET http://localhost:8080/health
 
-### Get all categories
-GET {{baseUrl}}/categories
-
-### Get category by id
-GET {{baseUrl}}/categories/1
-
-
-### Create category
-POST {{baseUrl}}/categories
+### Register a customer
+POST http://localhost:8080/users
 Content-Type: application/json
 
 {
-  "name": "Gloves"
+  "first_name": "Solomon",
+  "last_name": "Test",
+  "email": "solomon@example.com",
+  "password": "secret123"
 }
-
-

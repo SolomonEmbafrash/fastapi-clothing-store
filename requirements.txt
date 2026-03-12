@@ -1,3 +1,6 @@
 fastapi[standard]
+psycopg[binary]
+PyJWT
+python-dotenv
+email-validator
 pydantic
-psycopg
